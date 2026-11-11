@@ -269,6 +269,23 @@ function releaseWindowsVolume(ws: string, file: string): void {
 	}
 }
 
+/**
+ * On Windows: deletes the folders that Windows keeps at the root of a volume, such as System Volume
+ * Information, which only the system can read, from the volume at the sources directory: the
+ * scripts that walk the repository fail on them, such as setup-npm-registry.ts. Windows creates them
+ * when the volume gets a drive letter, which only the creation of the volume gives it, as the test
+ * jobs attach the image without one. The agent runs elevated, so it can take them over.
+ */
+function removeSystemFolders(ws: string): void {
+	for (const name of fs.readdirSync(ws).filter(entry => ['system volume information', '$recycle.bin'].includes(entry.toLowerCase()))) {
+		const folder = path.join(ws, name);
+		run('takeown', ['/F', folder, '/A', '/R', '/D', 'Y'], { stdio: 'inherit' });
+		run('icacls', [folder, '/grant', '*S-1-5-32-544:F', '/T', '/C', '/Q'], { stdio: 'inherit' });
+		fs.rmSync(folder, { recursive: true, force: true });
+		console.log(`Deleted ${folder}`);
+	}
+}
+
 function samePath(a: string, b: string): boolean {
 	return process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
 }
@@ -325,6 +342,7 @@ async function mountImage(ws: string, base: string): Promise<void> {
 		if (process.platform === 'win32') {
 			// The checkout of the job, with vhd.ps1, is out of the sources directory already
 			unmount = await mountWindowsImage(source, volumeFile(), ws, connections, { vhdScript: path.join(asideFolder(), VHD_SCRIPT), trust: false, vacate: () => { }, released: () => { } });
+			removeSystemFolders(ws);
 			// The files of an image belong to the user of the agent that built it
 			run('git', ['config', '--global', '--add', 'safe.directory', '*']);
 		} else {
@@ -424,6 +442,7 @@ function create(): void {
 		if (process.platform === 'win32') {
 			// 64 GB leave the jobs room, like the GitHub images
 			run('pwsh', ['-NoProfile', '-NonInteractive', '-File', path.join(asideFolder(), VHD_SCRIPT), '-Path', file, '-Create', '-FileSystem', 'NTFS', '-MaximumSizeGB', '64', '-MountFolder', ws], { stdio: 'inherit' });
+			removeSystemFolders(ws);
 		} else {
 			const { uid, gid } = os.userInfo();
 			run('truncate', ['-s', '64G', file]);
@@ -433,11 +452,6 @@ function create(): void {
 			run('sudo', ['rmdir', path.join(ws, 'lost+found')]);
 		}
 		checkoutCommit(ws, checkout.git, commit, origin);
-		if (process.platform === 'win32') {
-			// The folders that Windows keeps at the root of a volume, which git can't read
-			fs.mkdirSync(path.join(ws, '.git', 'info'), { recursive: true });
-			fs.appendFileSync(path.join(ws, '.git', 'info', 'exclude'), '/System Volume Information/\n/$RECYCLE.BIN/\n');
-		}
 	} catch (err) {
 		if (process.platform === 'win32') {
 			releaseWindowsVolume(ws, file);
@@ -486,6 +500,8 @@ function pack(): void {
 	const imageScript = path.join(import.meta.dirname, '../../../.github/workflows/workspace_image/image.ts');
 	if (process.platform === 'win32') {
 		spawnSync('fsutil', ['volume', 'diskfree', ws], { stdio: 'inherit' });
+		// In case Windows created them again during the install
+		removeSystemFolders(ws);
 		// Flushes the volume, removes its mount point and detaches the VHDX, whose file then holds the
 		// image. The rest of the job runs in the checkout of the job again, which holds image.ts too.
 		run('pwsh', ['-NoProfile', '-NonInteractive', '-File', path.join(asideFolder(), VHD_SCRIPT), '-Path', volumeFile(), '-MountFolder', ws, '-Detach'], { stdio: 'inherit' });
