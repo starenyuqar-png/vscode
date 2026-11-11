@@ -3,11 +3,16 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// Workspace images in Azure Pipelines: a disk image of the sources directory of a Linux job whose
-// dependencies are installed, which the Linux CI test jobs mount over their checkout, so that their
-// install steps install only what changed since. It uses the packed image format and the Linux mount
-// of the GitHub workspace images (see .github/workflows/workspace_image/README.md), with the pipeline
-// cache instead of artifacts. See workspace-image.yml for the steps.
+// Workspace images in Azure Pipelines: a disk image of the sources directory of a Linux or Windows job
+// whose dependencies are installed, which the CI test jobs mount over their checkout, so that their
+// install steps install only what changed since. It uses the packed image format and the Linux and
+// Windows mounts of the GitHub workspace images (see .github/workflows/workspace_image/README.md),
+// with the pipeline cache instead of artifacts. See workspace-image.yml for the steps.
+//
+// Linux mounts an ext4 volume in a sparse file over the checkout, which it hides. Windows can only
+// mount a volume at an empty folder, so the checkout of the job waits in the temporary folder of the
+// agent, on the same disk, while the volume is mounted: an NTFS volume in a VHDX, as the agents run
+// Windows Server 2022, which has no Dev Drives.
 //
 //   node workspaceImage.ts key
 //     Writes the files of the cache key: the native build inputs, then the lockfiles and the day.
@@ -24,7 +29,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { abortRestore, isMountPoint, mountLinuxImage, openFileSource } from '../../../.github/workflows/workspace_image/image.ts';
+import { abortRestore, isMountPoint, mountLinuxImage, mountWindowsImage, openFileSource } from '../../../.github/workflows/workspace_image/image.ts';
 import { computeNodeModulesBaseCacheKey, computePnpmStoreCacheKey } from './cacheKeys.ts';
 
 /** Written to the key files when the job must not save an image under its key: no image has it */
@@ -36,6 +41,8 @@ const STORE_FOLDER = '.build/pnpm-store';
 /** The checkouts of private repositories, which the test jobs check out themselves: an image holds neither their sources nor their credentials, so the image job doesn't check them out */
 const PRIVATE_FOLDERS = ['.build/distro', '.build/vscode-encrypt', '.build/vsda', '.build/vscode-regexp-languagedetection', '.build/.gitconfig-distro'];
 const RESTORE_TIMEOUT_SECONDS = 240;
+/** In a checkout: the script that creates, attaches and detaches the VHDX of a Windows image */
+const VHD_SCRIPT = '.github/workflows/workspace_image/win32/vhd.ps1';
 
 interface Metadata {
 	readonly commit: string;
@@ -76,7 +83,12 @@ function packedImage(): string {
 }
 
 function volumeFile(): string {
-	return temporary('workspace-image.ext4');
+	return temporary(process.platform === 'win32' ? 'workspace-image.vhdx' : 'workspace-image.ext4');
+}
+
+/** On Windows: where the checkout of the job waits while a volume is mounted at the sources directory */
+function asideFolder(): string {
+	return temporary('workspace-image-checkout');
 }
 
 function setVariable(name: string, value: string): void {
@@ -165,6 +177,102 @@ function linkCheckout(ws: string): string {
 	return target;
 }
 
+/** Renames, retrying while a scanner keeps a file of a folder open, as happens on Windows */
+function rename(from: string, to: string): void {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			fs.renameSync(from, to);
+			return;
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (attempt === 10 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES')) {
+				throw err;
+			}
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+		}
+	}
+}
+
+/** Moves the entries of a folder into another folder, or none of them */
+function moveEntries(from: string, to: string): void {
+	const moved: string[] = [];
+	try {
+		for (const entry of fs.readdirSync(from)) {
+			rename(path.join(from, entry), path.join(to, entry));
+			moved.push(entry);
+		}
+	} catch (err) {
+		for (const entry of moved) {
+			rename(path.join(to, entry), path.join(from, entry));
+		}
+		throw err;
+	}
+}
+
+/** The checkout of the job while a volume is mounted at the sources directory */
+interface IKeptCheckout {
+	/** The .git of the checkout, which the repository of the volume fetches the commit of the job from */
+	readonly git: string;
+	/** Puts the checkout back in the sources directory, once no volume is mounted there */
+	restore(): void;
+	/** Deletes what the job doesn't need once the commit of the job is checked out on the volume */
+	dispose(): void;
+}
+
+/**
+ * Keeps the checkout of the job while a volume is mounted at the sources directory. On Linux, links
+ * its .git in the temporary folder, as the volume hides the checkout. On Windows, where a volume can
+ * only be mounted at an empty folder, moves the checkout into the temporary folder of the agent, on
+ * the same disk, so that it only renames its entries. The checkout stays there once the volume is
+ * mounted, as deleting it would take time, and the image job moves it back after it packed the
+ * volume (see `pack`).
+ */
+function keepCheckout(ws: string): IKeptCheckout {
+	if (process.platform !== 'win32') {
+		const link = linkCheckout(ws);
+		return { git: link, restore: () => { }, dispose: () => fs.rmSync(link, { recursive: true, force: true }) };
+	}
+	const aside = asideFolder();
+	if (path.parse(aside).root.toLowerCase() !== path.parse(ws).root.toLowerCase()) {
+		throw new Error(`The temporary folder ${aside} is on another disk than ${ws}`);
+	}
+	fs.rmSync(aside, { recursive: true, force: true });
+	fs.mkdirSync(aside, { recursive: true });
+	moveEntries(ws, aside);
+	return { git: path.join(aside, '.git'), restore: () => moveCheckoutBack(ws), dispose: () => { } };
+}
+
+/** On Windows: moves the checkout that `keepCheckout` moved out of the sources directory back */
+function moveCheckoutBack(ws: string): void {
+	if (fs.readdirSync(ws).length) {
+		throw new Error(`Cannot move the checkout back to ${ws}, which is not empty`);
+	}
+	moveEntries(asideFolder(), ws);
+	fs.rmdirSync(asideFolder());
+}
+
+/** Whether a volume is mounted at a folder. On Windows, mountvol only lists the volume of a mount point. */
+function isVolumeMountedAt(folder: string): boolean {
+	return process.platform === 'win32'
+		? spawnSync('mountvol', [`${folder}\\`, '/L'], { stdio: 'ignore' }).status === 0
+		: isMountPoint(folder);
+}
+
+/** On Windows: removes the mount point of the volume at `ws` if there is one, detaches the VHDX and deletes it */
+function releaseWindowsVolume(ws: string, file: string): void {
+	spawnSync('mountvol', [`${ws}\\`, '/D'], { stdio: 'inherit' });
+	spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', 'Dismount-DiskImage -ImagePath $env:WORKSPACE_IMAGE_VHDX | Out-Null'], { stdio: 'inherit', timeout: 60_000, env: { ...process.env, WORKSPACE_IMAGE_VHDX: file } });
+	try {
+		fs.rmSync(file, { force: true });
+	} catch (err) {
+		console.log(`Cannot delete ${file}: ${err}`);
+	}
+}
+
+function samePath(a: string, b: string): boolean {
+	return process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+}
+
 /**
  * Brings the repository of the volume at `ws` to `commit`, the HEAD of the linked .git of the
  * checkout, which it fetches from there: git writes only the files that changed since the commit of
@@ -184,19 +292,23 @@ function checkoutCommit(ws: string, checkout: string, commit: string, origin: st
 	}
 }
 
-function setStoreVariables(ws: string): void {
+function setImageVariables(ws: string): void {
 	const store = path.join(ws, STORE_FOLDER);
 	fs.mkdirSync(store, { recursive: true });
 	// As computePnpmStoreCacheKey.ts sets them without an image
 	setVariable('PNPM_CONFIG_STORE_DIR', store);
 	setVariable('PNPM_CONFIG_CACHE_DIR', path.join(store, 'cache'));
+	// So that esbuild resolves pnpm's junctions on the volume, which is mounted without a drive letter
+	if (process.platform === 'win32') {
+		setVariable('GODEBUG', 'winreadlinkvolume=1');
+	}
 }
 
 async function mountImage(ws: string, base: string): Promise<void> {
-	if (process.platform !== 'linux') {
+	if (process.platform !== 'linux' && process.platform !== 'win32') {
 		throw new Error(`No workspace images on ${process.platform}`);
 	}
-	if (isMountPoint(ws)) {
+	if (isVolumeMountedAt(ws)) {
 		throw new Error(`A volume is mounted at ${ws} already`);
 	}
 	if (!fs.existsSync(packedImage())) {
@@ -204,28 +316,38 @@ async function mountImage(ws: string, base: string): Promise<void> {
 	}
 	const commit = git(ws, 'rev-parse', 'HEAD');
 	const origin = originUrl(ws);
-	const checkout = linkCheckout(ws);
 	const source = await openFileSource(packedImage());
+	let checkout: IKeptCheckout | undefined;
 	let unmount: (() => void) | undefined;
 	try {
-		unmount = await mountLinuxImage(source, volumeFile(), ws, os.availableParallelism());
+		checkout = keepCheckout(ws);
+		const connections = os.availableParallelism();
+		if (process.platform === 'win32') {
+			// The checkout of the job, with vhd.ps1, is out of the sources directory already
+			unmount = await mountWindowsImage(source, volumeFile(), ws, connections, { vhdScript: path.join(asideFolder(), VHD_SCRIPT), trust: false, vacate: () => { }, released: () => { } });
+			// The files of an image belong to the user of the agent that built it
+			run('git', ['config', '--global', '--add', 'safe.directory', '*']);
+		} else {
+			unmount = await mountLinuxImage(source, volumeFile(), ws, connections);
+		}
 		const metadata: Metadata = JSON.parse(fs.readFileSync(path.join(ws, METADATA_FILE), 'utf8'));
 		// pnpm records the path of its store in the node_modules folders
-		if (path.resolve(metadata.workspace) !== ws) {
+		if (!samePath(metadata.workspace, ws)) {
 			throw new Error(`The image holds the checkout of ${metadata.workspace}, not ${ws}`);
 		}
 		if (metadata.base !== base) {
 			throw new Error(`The image is built from other native build inputs (${metadata.base}) than the job (${base})`);
 		}
-		checkoutCommit(ws, checkout, commit, origin);
+		checkoutCommit(ws, checkout.git, commit, origin);
 		console.log(`Mounted the workspace image of ${metadata.commit}, built on ${metadata.created}, at ${ws}, and checked out ${commit}`);
 	} catch (err) {
 		// The checkout of the job is in the sources directory again
 		unmount?.();
+		checkout?.restore();
 		throw err;
 	} finally {
 		await source.close();
-		fs.rmSync(checkout, { recursive: true, force: true });
+		checkout?.dispose();
 	}
 }
 
@@ -271,54 +393,66 @@ async function restore(): Promise<void> {
 	}
 	setVariable('WORKSPACE_IMAGE_USED', String(used));
 	if (used) {
-		setStoreVariables(ws);
+		setImageVariables(ws);
 	}
 }
 
 /**
- * Mounts an empty ext4 volume in a sparse file over the checkout, and checks out the commit of the
- * checkout there, so that the install steps install into the volume: without a journal or reserved
- * blocks, and with the inode tables left to initialize, so that they stay zeros, which the packed
- * image doesn't store.
+ * Mounts an empty volume over the checkout, and checks out the commit of the checkout there, so that
+ * the install steps install into the volume. On Linux, an ext4 volume in a sparse file: without a
+ * journal or reserved blocks, and with the inode tables left to initialize, so that they stay zeros,
+ * which the packed image doesn't store. On Windows, an NTFS volume in a dynamic VHDX with blocks of
+ * 1 MB, like the GitHub images but without a Dev Drive, which Windows Server 2022 doesn't have.
  */
 function create(): void {
-	if (process.platform !== 'linux') {
+	if (process.platform !== 'linux' && process.platform !== 'win32') {
 		throw new Error(`No workspace images on ${process.platform}`);
 	}
 	if (readKey('base') === DISCARDED_KEY) {
 		throw new Error('No workspace image cache key');
 	}
 	const ws = sourcesDirectory();
-	if (isMountPoint(ws)) {
+	if (isVolumeMountedAt(ws)) {
 		throw new Error(`A volume is mounted at ${ws} already`);
 	}
 	const commit = git(ws, 'rev-parse', 'HEAD');
 	const origin = originUrl(ws);
-	const checkout = linkCheckout(ws);
+	const checkout = keepCheckout(ws);
 	const file = volumeFile();
-	const { uid, gid } = os.userInfo();
-	let mounted = false;
 	try {
 		fs.rmSync(file, { force: true });
-		run('truncate', ['-s', '64G', file]);
-		run('mkfs.ext4', ['-q', '-F', '-O', '^has_journal', '-m', '0', '-E', `lazy_itable_init=1,root_owner=${uid}:${gid}`, file]);
-		run('sudo', ['mount', '-o', 'loop,noatime,noinit_itable', file, ws]);
-		mounted = true;
-		// It would be an untracked folder of the checkout
-		run('sudo', ['rmdir', path.join(ws, 'lost+found')]);
-		checkoutCommit(ws, checkout, commit, origin);
+		if (process.platform === 'win32') {
+			// 64 GB leave the jobs room, like the GitHub images
+			run('pwsh', ['-NoProfile', '-NonInteractive', '-File', path.join(asideFolder(), VHD_SCRIPT), '-Path', file, '-Create', '-FileSystem', 'NTFS', '-MaximumSizeGB', '64', '-MountFolder', ws], { stdio: 'inherit' });
+		} else {
+			const { uid, gid } = os.userInfo();
+			run('truncate', ['-s', '64G', file]);
+			run('mkfs.ext4', ['-q', '-F', '-O', '^has_journal', '-m', '0', '-E', `lazy_itable_init=1,root_owner=${uid}:${gid}`, file]);
+			run('sudo', ['mount', '-o', 'loop,noatime,noinit_itable', file, ws]);
+			// It would be an untracked folder of the checkout
+			run('sudo', ['rmdir', path.join(ws, 'lost+found')]);
+		}
+		checkoutCommit(ws, checkout.git, commit, origin);
+		if (process.platform === 'win32') {
+			// The folders that Windows keeps at the root of a volume, which git can't read
+			fs.mkdirSync(path.join(ws, '.git', 'info'), { recursive: true });
+			fs.appendFileSync(path.join(ws, '.git', 'info', 'exclude'), '/System Volume Information/\n/$RECYCLE.BIN/\n');
+		}
 	} catch (err) {
-		if (mounted) {
+		if (process.platform === 'win32') {
+			releaseWindowsVolume(ws, file);
+		} else if (isMountPoint(ws)) {
 			spawnSync('sudo', ['umount', ws], { stdio: 'inherit' });
 		}
 		fs.rmSync(file, { force: true });
+		checkout.restore();
 		throw err;
 	} finally {
-		fs.rmSync(checkout, { recursive: true, force: true });
+		checkout.dispose();
 	}
 	console.log(`Mounted an empty workspace image volume at ${ws}, and checked out ${commit}`);
 	setVariable('WORKSPACE_IMAGE_USED', 'true');
-	setStoreVariables(ws);
+	setImageVariables(ws);
 }
 
 /**
@@ -328,7 +462,7 @@ function create(): void {
  */
 function pack(): void {
 	const ws = sourcesDirectory();
-	if (!isMountPoint(ws)) {
+	if (!isVolumeMountedAt(ws)) {
 		throw new Error(`No workspace image volume is mounted at ${ws}`);
 	}
 	if (!fs.existsSync(path.join(ws, 'node_modules'))) {
@@ -349,6 +483,19 @@ function pack(): void {
 	}
 	const metadata: Metadata = { commit, workspace: ws, base: readKey('base'), created: new Date().toISOString() };
 	fs.writeFileSync(path.join(ws, METADATA_FILE), `${JSON.stringify(metadata, null, '\t')}\n`);
+	const imageScript = path.join(import.meta.dirname, '../../../.github/workflows/workspace_image/image.ts');
+	if (process.platform === 'win32') {
+		spawnSync('fsutil', ['volume', 'diskfree', ws], { stdio: 'inherit' });
+		// Flushes the volume, removes its mount point and detaches the VHDX, whose file then holds the
+		// image. The rest of the job runs in the checkout of the job again, which holds image.ts too.
+		run('pwsh', ['-NoProfile', '-NonInteractive', '-File', path.join(asideFolder(), VHD_SCRIPT), '-Path', volumeFile(), '-MountFolder', ws, '-Detach'], { stdio: 'inherit' });
+		moveCheckoutBack(ws);
+		fs.mkdirSync(cacheFolder(), { recursive: true });
+		run(process.execPath, [imageScript, 'pack', '--in', volumeFile(), '--out', packedImage()], { stdio: 'inherit' });
+		fs.rmSync(volumeFile(), { force: true });
+		console.log(`Packed the workspace image of ${commit}`);
+		return;
+	}
 	run('df', ['-h', ws], { stdio: 'inherit' });
 	run('sync', []);
 	// The loop device punches holes for the blocks that the install freed, which the packed image then doesn't store
@@ -364,7 +511,7 @@ function pack(): void {
 	}
 	try {
 		fs.mkdirSync(cacheFolder(), { recursive: true });
-		run(process.execPath, [path.join(import.meta.dirname, '../../../.github/workflows/workspace_image/image.ts'), 'pack', '--in', volumeFile(), '--out', packedImage()], { stdio: 'inherit' });
+		run(process.execPath, [imageScript, 'pack', '--in', volumeFile(), '--out', packedImage()], { stdio: 'inherit' });
 	} finally {
 		// For the rest of the job
 		spawnSync('sudo', ['mount', '-o', 'remount,rw', ws], { stdio: 'inherit' });
